@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:isolate';
 import 'dart:typed_data';
 
 import '../codecs/g711/dart_g711.dart';
@@ -410,73 +411,99 @@ Future<void> _serveFileWithRange(File file, HttpRequest request) async {
   await request.response.close();
 }
 
-/// Background fire-and-forget full-file transcode: reads the G.711 source
-/// and writes a PCM WAV to `<cache>/<name>.pcm.wav` via a temp file +
-/// atomic rename. Safe against concurrent invocations for the same file
-/// (later invocations discard their tmp on rename conflict).
+/// Kick off a background cache-populate for [safeName] and return
+/// immediately. The heavy work (whole-file G.711 → PCM WAV transcode)
+/// runs on a fresh isolate via [Isolate.run] so the main event loop
+/// stays free to accept RTP and serve concurrent /playback requests.
+///
+/// Fire-and-forget; errors are logged, not surfaced. Safe against
+/// concurrent invocations for the same file (later invocations discard
+/// their tmp on rename conflict).
 Future<void> _populateCache({
   required String safeName,
   required String srcPath,
 }) async {
+  // Snapshot the global here — inside the worker isolate, module-level
+  // variables are re-initialized to their declared defaults and do NOT
+  // reflect values set in the main isolate at startup.
+  final cachePath = playbackCachePath;
   try {
-    final cacheDir = Directory(playbackCachePath);
-    await cacheDir.create(recursive: true);
-    final finalPath = '${cacheDir.path}/$safeName.pcm.wav';
-    if (File(finalPath).existsSync()) return;
-    final tmpPath = '$finalPath.tmp.'
-        '${DateTime.now().microsecondsSinceEpoch}';
-
-    final srcFile = File(srcPath);
-    final srcRaf = await srcFile.open();
-    final WavInfo info;
-    try {
-      info = await readWavInfo(srcRaf);
-    } catch (e) {
-      await srcRaf.close();
-      print('Cache populate: cannot read $srcPath: $e');
-      return;
-    }
-    if (!info.isG711) {
-      await srcRaf.close();
-      return;
-    }
-    final codec = info.isAlaw ? DartG711Codec.g711a() : DartG711Codec.g711u();
-
-    final outRaf = await File(tmpPath).open(mode: FileMode.write);
-    try {
-      outRaf.writeFromSync(PcmWavSink.buildRiffHeader(
-        dataSize: 2 * info.dataSize,
-        sampleRate: info.sampleRate,
-        numChannels: info.numChannels,
-        bytesPerSample: 2,
-      ));
-      await srcRaf.setPosition(info.dataOffset);
-      int remaining = info.dataSize;
-      const chunkSize = 8192;
-      while (remaining > 0) {
-        final want = remaining < chunkSize ? remaining : chunkSize;
-        final chunk = await srcRaf.read(want);
-        if (chunk.isEmpty) break;
-        remaining -= chunk.length;
-        outRaf.writeFromSync(codec.decode(Uint8List.fromList(chunk)));
-      }
-      await outRaf.flush();
-    } finally {
-      await outRaf.close();
-      await srcRaf.close();
-    }
-
-    try {
-      await File(tmpPath).rename(finalPath);
-      print('Playback cache populated: $finalPath');
-    } catch (_) {
-      // Concurrent request beat us to it; discard tmp.
-      try {
-        await File(tmpPath).delete();
-      } catch (_) {}
-    }
+    await Isolate.run(
+      () => _cachePopulateWorker(safeName, srcPath, cachePath),
+      debugName: 'cache-populate:$safeName',
+    );
   } catch (e) {
     print('Cache populate failed for $safeName: $e');
+  }
+}
+
+/// Isolate entry point for [_populateCache]. Reads [srcPath] (expected
+/// to be a G.711 WAV), decodes the entire data chunk to 16-bit PCM,
+/// writes a canonical PCM WAV to a `.tmp.<micros>` file in [cachePath],
+/// then atomic-renames into place at `<cachePath>/<safeName>.pcm.wav`.
+///
+/// Runs in a fresh isolate — do NOT read main-isolate globals here.
+/// Anything the worker needs must be threaded through this signature.
+Future<void> _cachePopulateWorker(
+  String safeName,
+  String srcPath,
+  String cachePath,
+) async {
+  final cacheDir = Directory(cachePath);
+  await cacheDir.create(recursive: true);
+  final finalPath = '${cacheDir.path}/$safeName.pcm.wav';
+  if (File(finalPath).existsSync()) return;
+  final tmpPath = '$finalPath.tmp.'
+      '${DateTime.now().microsecondsSinceEpoch}';
+
+  final srcFile = File(srcPath);
+  final srcRaf = await srcFile.open();
+  final WavInfo info;
+  try {
+    info = await readWavInfo(srcRaf);
+  } catch (e) {
+    await srcRaf.close();
+    print('Cache populate: cannot read $srcPath: $e');
+    return;
+  }
+  if (!info.isG711) {
+    await srcRaf.close();
+    return;
+  }
+  final codec = info.isAlaw ? DartG711Codec.g711a() : DartG711Codec.g711u();
+
+  final outRaf = await File(tmpPath).open(mode: FileMode.write);
+  try {
+    outRaf.writeFromSync(PcmWavSink.buildRiffHeader(
+      dataSize: 2 * info.dataSize,
+      sampleRate: info.sampleRate,
+      numChannels: info.numChannels,
+      bytesPerSample: 2,
+    ));
+    await srcRaf.setPosition(info.dataOffset);
+    int remaining = info.dataSize;
+    const chunkSize = 8192;
+    while (remaining > 0) {
+      final want = remaining < chunkSize ? remaining : chunkSize;
+      final chunk = await srcRaf.read(want);
+      if (chunk.isEmpty) break;
+      remaining -= chunk.length;
+      outRaf.writeFromSync(codec.decode(Uint8List.fromList(chunk)));
+    }
+    await outRaf.flush();
+  } finally {
+    await outRaf.close();
+    await srcRaf.close();
+  }
+
+  try {
+    await File(tmpPath).rename(finalPath);
+    print('Playback cache populated: $finalPath');
+  } catch (_) {
+    // Concurrent request beat us to it; discard tmp.
+    try {
+      await File(tmpPath).delete();
+    } catch (_) {}
   }
 }
 

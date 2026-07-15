@@ -19,6 +19,7 @@ The recorder listens on the HTTP address configured by `.env`:
 | `AUDIO_PATH`                     | Where `.wav` files are written              | `E:/recordings` |
 | `RECORDER_CODEC`                 | `pcm` (Phase 1) or `alaw` / `mulaw` (Phase 2) | **`alaw`** |
 | `RECORDER_IDLE_TIMEOUT_SECONDS`  | Auto-finalize after N seconds of RTP silence | `60` |
+| `RECORDER_WORKER_COUNT`          | Number of recording worker isolates (see §5.2). `0` = inline (main isolate). | `cpu_cores - 1` |
 | `PLAYBACK_CACHE_ENABLED`         | Cache PCM transcodes for browser playback   | `true` |
 | `PLAYBACK_CACHE_PATH`            | Directory for transcoded PCM cache          | `${AUDIO_PATH}/.pcm-cache` |
 | `AST_DB_*`                       | Asterisk DB for metadata persistence        | (see .env.example) |
@@ -275,10 +276,13 @@ handset model, capture the RTP with `tcpdump -w file.pcap 'udp and port
   ≈ 240 KB/s of physical write. Trivial for any modern disk.
 - **CPU**: <2 % of one core for 30 concurrent PCM recordings. G.711
   passthrough is even less (no decode).
-- **RTP receive path is single-threaded** on the Dart event loop.
-  Sink writes are `writeFromSync` — synchronous but each call takes
+- **RTP receive path is now per-worker-isolate** (see §5.2): each call
+  is bound + written entirely inside a worker isolate, so the load
+  scales across CPU cores. Set `RECORDER_WORKER_COUNT=0` to fall back
+  to the single-isolate (main-loop) path if you need to debug.
+- Sink writes are `writeFromSync` — synchronous but each call takes
   ~microseconds because it hits the OS write cache, not disk.
-- **Playback cache populate runs on a background isolate** (see §5),
+- **Playback cache populate runs on a background isolate** (see §5.1),
   so a `/playback` burst does not stall live RTP recording.
 
 ### Failure modes
@@ -295,7 +299,7 @@ handset model, capture the RTP with `tcpdump -w file.pcap 'udp and port
 
 ## 5. Isolate-based improvements
 
-### Current use — cache populate off the main isolate
+### 5.1 Playback cache populate — one-shot isolate
 
 The `/playback` cache-populate task (full-file G.711 → PCM WAV
 transcode) runs on a background isolate via `Isolate.run(...)`. The
@@ -312,13 +316,78 @@ This matters because:
   threads, so the recorder now scales past a single core for these
   heavy tasks without any code-path changes for the RTP recorder.
 
-### Not moved to isolates (yet)
+### 5.2 Recording worker pool — one isolate per CPU core
+
+Each `/start` no longer runs on the main isolate. Instead, at startup
+the recorder spawns a fixed pool of **worker isolates** and routes
+each new call to the least-loaded worker. That worker owns the UDP
+socket, the on-disk sink, the packet-receive callback, and the idle
+timer for the entire lifetime of that recording.
+
+**Configuration**
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `RECORDER_WORKER_COUNT` | `Platform.numberOfProcessors - 1`, clamped to `[1..16]` | Number of worker isolates. Set to `0` to force the legacy inline path (recording runs on the main isolate — useful for debugging). |
+
+Startup log line reports the effective value:
+
+```
+listening on 0.0.0.0:8080 (codec=alaw, idle_timeout=60s,
+audio_path=/var/recordings, workers=7, playback_cache=...)
+```
+
+**Why a pool (not one isolate per call)**
+
+- Isolate spawn cost is ~10-15 ms. At 30 calls/sec inbound (peak) that
+  would add up. Pool workers are spawned once at startup.
+- One DB connection per worker (not per call) — 7 pooled MySQL
+  connections for a 8-core host, not 30+.
+- Message-passing routing table lives on the main isolate; workers
+  never talk to each other. `/stop` for `call-42` is dispatched to
+  whichever worker owns it via the routing table.
+
+**Failure isolation**
+
+A packet-parse crash, a corrupt WAV write, or an OOM in one worker's
+call handling cannot take down other calls on other workers. The main
+isolate stays up regardless.
+
+**Under the hood** (`lib/src/recorder/worker_pool.dart`)
+
+- `RecorderWorkerPool.initialize({mode, workerCount})` is called once
+  from `bin/dart_rtp_recorder.dart`. In `WorkerMode.isolated` it
+  spawns `workerCount` workers via `Isolate.spawn`; each worker sends
+  back its command `SendPort` in a handshake, then loops on incoming
+  `{type, ...}` messages.
+- `pool.start({filename, ip, audioPath, codec, idleTimeout})`
+  picks the least-loaded worker, sends a `start` message, waits for a
+  `{port, codec, container, sampleRate}` reply, and records the
+  routing entry.
+- `pool.stop(filename)` looks up the owning worker in the routing
+  table, sends a `stop` message, and returns the `RecordingResult`.
+- When a worker's idle timer fires (no RTP for
+  `RECORDER_IDLE_TIMEOUT_SECONDS`), it finalizes locally and posts
+  `{type: 'autoFinalized', filename, db}` back to the main isolate so
+  the routing table gets cleaned up and the DB insert happens.
+- DB inserts always happen on the **main isolate** — workers post a
+  `{type: 'dbInsert', ...}` message with the metadata; main runs the
+  eloquent write using its single existing connection.
+- `WorkerMode.inline` bypasses the pool entirely and preserves the
+  pre-pool code path — used by the test suite so per-call unit tests
+  don't need to spawn isolates.
+
+**HTTP contract is unchanged.** From the dart-ari caller's point of
+view, `/start`, `/stop`, `/playback`, and `/status` look and behave
+identically to the pre-pool release — the routing to a worker is a
+pure implementation detail.
+
+### 5.3 Not moved to isolates (yet)
 
 | Candidate | Verdict | Why |
 |---|---|---|
-| RTP receive → sink write | **Stay single-threaded.** | <2 % CPU at 30 concurrent calls; adding message-passing per-packet would cost more than it saves. |
-| On-the-fly `/playback` transcode | Not moved yet. | Would need cross-isolate `Stream<List<int>>` piping — non-trivial. Cache-populate already absorbs the second and subsequent requests. |
-| Phase 3 Opus encoding (future) | **Will use an isolate pool.** | Opus is genuinely CPU-bound (~1 % of a core per call at 24 kbps). At 30 concurrent calls + shared with RTP receive, this would saturate a single event loop. |
+| On-the-fly `/playback` transcode | Not moved. | Would need cross-isolate `Stream<List<int>>` piping — non-trivial. Cache-populate already absorbs the second and subsequent requests. |
+| Phase 3 Opus encoding (future) | **Will piggyback on the recording pool.** | Opus is genuinely CPU-bound (~1 % of a core per call at 24 kbps). Because each call already lives entirely inside a worker isolate, adding Opus encoding to the sink is a per-worker code change with no additional threading work. |
 
 Nothing in the ARI client changes for §5 — it's an internal recorder
 improvement.
@@ -327,7 +396,11 @@ improvement.
 
 ## 6. Change log referenced by this doc
 
-Commit `f7f8686` (Recording pipeline: streaming sinks, playback, and
-RTP parser hardening) is the baseline for everything above.
-Subsequent isolate work lands as a follow-up commit — API contract
-unchanged.
+- `f7f8686` — Recording pipeline: streaming sinks, playback, and
+  RTP parser hardening (baseline for the HTTP contract described
+  above).
+- `a3fc329` — Playback cache populate moved to a background isolate
+  + this integration doc.
+- (this commit) — Recording worker pool: one isolate per CPU core,
+  routed `/start` and `/stop`, `RECORDER_WORKER_COUNT` env var.
+  HTTP contract unchanged.

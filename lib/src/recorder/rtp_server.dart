@@ -7,6 +7,7 @@ import 'package:dart_rtp_recorder/src/db_queries.dart';
 import '../rtp/rtp_packet.dart';
 import 'recording_sink.dart';
 import 'sink_factory.dart';
+import 'worker_pool.dart';
 
 /// Directory where recordings are written. Populated from `AUDIO_PATH` in
 /// `bin/dart_rtp_recorder.dart`.
@@ -34,8 +35,26 @@ class RecordingRegistry {
   static _ActiveRecording? _remove(String filename) => _active.remove(filename);
 
   /// Snapshot of currently active recording filenames — useful for /status
-  /// endpoints, tests, and shutdown draining.
-  static List<String> active() => List.unmodifiable(_active.keys);
+  /// endpoints, tests, and shutdown draining. Includes both inline
+  /// recordings and any owned by the worker pool.
+  static List<String> active() {
+    final pool = RecorderWorkerPool.instance;
+    if (pool != null && pool.isIsolated) {
+      // Merge pool routing keys with any inline ones (there shouldn't
+      // normally be both, but /status is best-effort).
+      final set = <String>{..._active.keys, ...pool.active()};
+      return List.unmodifiable(set);
+    }
+    return List.unmodifiable(_active.keys);
+  }
+
+  /// True if [filename] is currently being recorded on ANY path (inline
+  /// or pool). Used by [startRecording] to reject duplicates.
+  static bool contains(String filename) {
+    if (_active.containsKey(filename)) return true;
+    final pool = RecorderWorkerPool.instance;
+    return pool != null && pool.isIsolated && pool.isActive(filename);
+  }
 }
 
 class _ActiveRecording {
@@ -121,7 +140,7 @@ Future<void> startRecording(
 
   // Reject duplicate active recordings for the same filename — otherwise
   // two UDP sockets would race to write the same file.
-  if (RecordingRegistry._active.containsKey(safeName)) {
+  if (RecordingRegistry.contains(safeName)) {
     request.response.statusCode = HttpStatus.conflict;
     request.response.headers.contentType = ContentType.json;
     request.response.write(json.encode({
@@ -129,6 +148,50 @@ Future<void> startRecording(
       'filename': safeName,
     }));
     await request.response.close();
+    return;
+  }
+
+  // If the pool is up, delegate to a worker isolate. Everything below
+  // this block is the legacy inline path, kept for tests and for the
+  // opt-out `RECORDER_WORKER_COUNT=0` configuration.
+  final pool = RecorderWorkerPool.instance;
+  if (pool != null && pool.isIsolated) {
+    try {
+      final res = await pool.start(
+        filename: safeName,
+        ip: ip,
+        audioPath: audioPath,
+        codec: recorderCodec,
+        idleTimeout: recorderIdleTimeout,
+      );
+      print('Recording $safeName started on '
+          '$ip:${res.port} (codec=${res.codec}, pool)');
+      request.response.headers.contentType = ContentType.json;
+      request.response.write(json.encode({
+        'file_name': safeName,
+        'rtp_port': res.port,
+        'codec': res.codec,
+        'container': res.container,
+        'sample_rate': res.sampleRate,
+      }));
+      await request.response.close();
+    } on DuplicateRecordingException {
+      request.response.statusCode = HttpStatus.conflict;
+      request.response.headers.contentType = ContentType.json;
+      request.response.write(json.encode({
+        'error': 'recording already in progress',
+        'filename': safeName,
+      }));
+      await request.response.close();
+    } catch (e) {
+      request.response.statusCode = HttpStatus.internalServerError;
+      request.response.headers.contentType = ContentType.json;
+      request.response.write(json.encode({
+        'error': 'pool start failed',
+        'detail': '$e',
+      }));
+      await request.response.close();
+    }
     return;
   }
 
@@ -239,6 +302,33 @@ Future<void> startRecording(
 /// and returns the [RecordingResult] as JSON.
 Future<void> stopRecording(String filename, HttpRequest request) async {
   final safeName = _sanitizeFilename(filename);
+
+  // Pool path first — if a worker owns this recording, route to it.
+  final pool = RecorderWorkerPool.instance;
+  if (pool != null && pool.isIsolated && pool.isActive(safeName)) {
+    try {
+      final result = await pool.stop(safeName);
+      if (result == null) {
+        // Race: pool auto-finalized between our isActive check and
+        // stop dispatch. Fall through to 404.
+      } else {
+        request.response.headers.contentType = ContentType.json;
+        request.response.write(json.encode(result.toJson()));
+        await request.response.close();
+        return;
+      }
+    } catch (e) {
+      request.response.statusCode = HttpStatus.internalServerError;
+      request.response.headers.contentType = ContentType.json;
+      request.response.write(json.encode({
+        'error': 'finalize failed',
+        'detail': '$e',
+      }));
+      await request.response.close();
+      return;
+    }
+  }
+
   final active = RecordingRegistry._remove(safeName);
   if (active == null) {
     request.response.statusCode = HttpStatus.notFound;

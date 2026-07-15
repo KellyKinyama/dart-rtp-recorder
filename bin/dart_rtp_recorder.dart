@@ -3,10 +3,11 @@ import 'dart:io';
 import 'package:dart_rtp_recorder/dart_rtp_recorder.dart';
 import 'package:dart_rtp_recorder/src/config.dart';
 import 'package:dart_rtp_recorder/src/http/playback.dart';
+import 'package:dart_rtp_recorder/src/recorder/worker_pool.dart';
 
 import 'package:dotenv/dotenv.dart';
 
-void main(List<String> arguments) {
+Future<void> main(List<String> arguments) async {
   var env = DotEnv(includePlatformEnvironment: true)..load();
   String ip = env['HTTP_SERVER_ADDRESS']!;
   int port = int.parse(env['HTTP_SERVER_PORT']!);
@@ -51,10 +52,27 @@ void main(List<String> arguments) {
   Config.asteriskDbUsername = env['AST_DB_USERNAME']!;
   Config.asteriskDbPassword = env['AST_DB_PASSWORD']!;
 
+  // Worker-isolate pool. Defaults to `Platform.numberOfProcessors - 1`
+  // (clamped to [1..16]); set `RECORDER_WORKER_COUNT=0` to force the
+  // legacy inline path (recording runs on the main isolate).
+  final requestedWorkers = int.tryParse(env['RECORDER_WORKER_COUNT'] ?? '');
+  final defaultWorkers =
+      (Platform.numberOfProcessors - 1).clamp(1, 16).toInt();
+  final workerCount = requestedWorkers ?? defaultWorkers;
+  if (workerCount > 0) {
+    await RecorderWorkerPool.initialize(
+      mode: WorkerMode.isolated,
+      workerCount: workerCount,
+    );
+  } else {
+    await RecorderWorkerPool.initialize(mode: WorkerMode.inline);
+  }
+
   HttpRtpServer(ip, port);
   print('listening on $ip:$port '
       '(codec=$recorderCodec, '
       'idle_timeout=${recorderIdleTimeout.inSeconds}s, '
       'audio_path=$audioPath, '
+      'workers=$workerCount, '
       'playback_cache=${playbackCacheEnabled ? playbackCachePath : "disabled"})');
 }

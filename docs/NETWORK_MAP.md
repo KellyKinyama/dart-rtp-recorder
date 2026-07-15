@@ -1,251 +1,68 @@
-# Network Map — dart-rtp-recorder deployment
+# Network map — IP address inventory
 
-Purpose: give the networks team a single sheet to record actual link
-speeds, measured throughput, and utilization for every hop the call-
-recording pipeline depends on. All bandwidth figures below are
-computed from the 30-concurrent-call / 10-min-avg workload used
-throughout [RECORDER_API.md](RECORDER_API.md#codec-sizing-10-min-avg-call-6300-callsday).
+One-page sheet for the networks team: name the hosts and record their
+IP addresses. All values marked `?` need confirmation.
 
-Please fill in the **"To be measured"** columns and return.
+Sources pre-filled from:
+- `dart-rtp-recorder/.env` (recorder host)
+- `C:\www\dart\dart-ari\.env` (ARI client host)
 
----
-
-## 1. Topology
-
-```mermaid
-flowchart LR
-  subgraph EXT[External / WAN]
-    ITSP[ITSP / SIP Carrier]
-  end
-
-  subgraph LAN[Data-center LAN]
-    subgraph AST_HOST[Asterisk host]
-      AST[Asterisk PBX]
-      ARI[dart-ari<br/>bin/queue_app_main.dart]
-    end
-    REC[dart-rtp-recorder<br/>HTTP + RTP receiver]
-    DB[(MySQL<br/>recordings table)]
-    STORE[(Recording storage<br/>AUDIO_PATH volume)]
-    VEEAM[Veeam backup server]
-    QA[QA / supervisor<br/>browsers]
-  end
-
-  subgraph AGENTS[Agent floor]
-    PHONES[Agent SIP phones<br/>softphones or deskphones]
-  end
-
-  %% Media
-  ITSP <-- SIP + RTP --> AST
-  AST <-- SIP + RTP --> PHONES
-  AST -- externalMedia RTP<br/>PCMA one-way --> REC
-
-  %% Control
-  ARI <-- ARI HTTP + WS --> AST
-  ARI -- POST /start /stop --> REC
-
-  %% Recorder side
-  REC -- INSERT recordings --> DB
-  REC -- WAV writes --> STORE
-  QA -- GET /playback --> REC
-
-  %% Backup
-  STORE -- daily / incremental --> VEEAM
-```
-
-If any of the boxes above are collapsed onto the same physical host
-(e.g. `dart-ari` runs on the Asterisk box, or MySQL is on the
-Asterisk host), mark it in §3 — the intra-host links can be crossed
-off the list.
+Note: the two `.env` files currently disagree on the recorder's IP —
+recorder binds `10.100.54.137`, dart-ari has `VOICE_LOGGER_IP=10.1.101.155`.
+Please confirm the correct value in production.
 
 ---
 
-## 2. Bandwidth budget (design targets)
+## Hosts
 
-Baseline workload: **30 concurrent calls, G.711 a-law, 10-min avg
-duration.** Peaks assume all 30 calls active simultaneously and
-codec/format matching the current `RECORDER_CODEC=alaw` recommendation.
-
-| # | Link | Protocol | Direction | Payload/call | Peak (30 calls) | Notes |
-|---|---|---|---|---|---|---|
-| L1 | ITSP ↔ Asterisk | SIP (UDP/TCP) + RTP (UDP) | bidirectional | ~87 kbps each way (G.711 + IP/UDP/RTP overhead) | **~2.6 Mbps each way** | Existing carrier link; unchanged by recorder |
-| L2 | Agents ↔ Asterisk | SIP + RTP | bidirectional | ~87 kbps each way | **~2.6 Mbps each way** | Same as L1 but on the LAN side |
-| L3 | Asterisk → Recorder (`externalMedia`) | RTP (UDP) | **one-way** | ~87 kbps | **~2.6 Mbps** | The new stream this project adds. G.711 a-law, 50 pps, 160-byte payload |
-| L4 | dart-ari → Recorder | HTTP (TCP) | request/response | ~1 KB per `/start` + ~1 KB per `/stop` | **negligible** (<10 kbps) | Two round-trips per call |
-| L5 | dart-ari ↔ Asterisk | ARI HTTP + WebSocket | bidirectional | small JSON events | **<50 kbps** | Stasis event stream, control commands |
-| L6 | Recorder → MySQL | MySQL wire (TCP 3306) | mostly writes | ~1 KB per finalized call | **negligible** | ~30 inserts / 10 min = 0.05 QPS |
-| L7 | Recorder ↔ Storage (`AUDIO_PATH`) | Local FS or SMB/NFS if remote | mostly writes | ~30 KB/s aggregate | **~240 KB/s = 2 Mbps** | 50 packet writes/sec/call × 30 calls, NTFS coalesces to ~4 KiB blocks |
-| L8 | QA browsers → Recorder (`/playback`) | HTTP (TCP) | mostly downloads | ~5 MB per 10-min a-law WAV; ~10 MB PCM cache | **burst 100-500 Mbps** during QA review windows | Range requests supported; multiple concurrent reviewers |
-| L9 | Recorder storage → Veeam | Veeam wire (TCP, usually 2500/6162/etc.) | reads | see backup table in §4 | **~940 Mbps sustained target** for full backup | 1 GbE minimum per §5.2 of the ops plan |
-
-### 2.1 Where the numbers come from
-
-- G.711 on-wire: 64 kbps codec + 12-byte RTP + 8-byte UDP + 20-byte IPv4 header per 20 ms frame = **~87.2 kbps** per one-way stream. Add L2 overhead (14 B Ethernet + 4 B FCS) for switch-port budgeting: **~93 kbps**.
-- 30 concurrent × 87 kbps = **2.61 Mbps** one-way (L3).
-- Playback burst is bounded by the reviewer's browser + LAN NIC, not the recorder. A single 10-min a-law WAV is 4.8 MB (or ~9.6 MB after PCM cache populate); at 1 GbE that's ~40 ms — most of the wall-clock latency is disk seek + first-byte, not link speed.
-- L1 and L2 are pre-existing links; nothing about recorder deployment changes them.
-
----
-
-## 3. Per-link fields for the networks team to fill in
-
-For each link L1-L9 below, please record: NIC speed, duplex, VLAN
-(if any), measured throughput (iperf3 or similar), current utilization
-at peak hour, round-trip latency, and any known bottleneck. **Peak
-required** is copied from §2 for context.
-
-### L1 — ITSP ↔ Asterisk (SIP trunk)
-| Field | Value |
-|---|---|
-| Peak required | ~2.6 Mbps each way |
-| Interface on Asterisk | _(e.g. eth1)_ |
-| Interface on carrier CPE | _(if any)_ |
-| Link speed / duplex | ______ Mbps / ____ |
-| VLAN / VRF | ______ |
-| Measured throughput (iperf3, TCP) | ______ Mbps |
-| Peak-hour utilization | ______ % |
-| RTT p50 / p99 | ______ / ______ ms |
-| Jitter (95th percentile) | ______ ms |
-| QoS marking (DSCP EF for RTP?) | Y / N — ______ |
-| Known bottleneck | ______ |
-
-### L2 — Agents ↔ Asterisk (LAN)
-| Field | Value |
-|---|---|
-| Peak required | ~2.6 Mbps each way |
-| Access switch model / port speed | ______ |
-| VLAN | ______ |
-| Uplink speed to core | ______ Gbps |
-| Peak-hour utilization | ______ % |
-| RTT to Asterisk (from a phone) | ______ ms |
-| PoE budget (if deskphones) | ______ |
-
-### L3 — Asterisk → Recorder (externalMedia RTP)  ⚑ new
-| Field | Value |
-|---|---|
-| Peak required | ~2.6 Mbps one-way |
-| Interface on Asterisk (source) | ______ |
-| Interface on Recorder (dest) | ______ |
-| Link speed / duplex | ______ Mbps / ____ |
-| Same VLAN as SIP? | Y / N |
-| Path: same switch / cross-switch / cross-VLAN | ______ |
-| Firewall between them? | Y / N — rules? |
-| Measured throughput (iperf3 UDP, 3 Mbps target) | ______ / packets lost ______ |
-| RTT p50 / p99 | ______ / ______ ms |
-| Notes on packet loss / reorder | ______ |
-
-### L4 — dart-ari → Recorder (control HTTP)
-| Field | Value |
-|---|---|
-| Peak required | <10 kbps |
-| Port | 8080 (or `HTTP_SERVER_PORT`) |
-| Same host as L3? | Y / N |
-| Firewall / ACL | ______ |
-| TLS? | Y / N — if N, why acceptable |
-| RTT p50 | ______ ms |
-
-### L5 — dart-ari ↔ Asterisk ARI
-| Field | Value |
-|---|---|
-| Peak required | <50 kbps |
-| ARI HTTP port | 8088 (default) |
-| WebSocket sustained? | Y / N |
-| Same host? | Y / N |
-| RTT p50 | ______ ms |
-
-### L6 — Recorder → MySQL
-| Field | Value |
-|---|---|
-| Peak required | negligible |
-| MySQL host | ______ |
-| Port | 3306 |
-| Same host as recorder? | Y / N |
-| Same host as Asterisk? | Y / N |
-| Connection pool size | 1 (main isolate) |
-| RTT p50 | ______ ms |
-
-### L7 — Recorder ↔ AUDIO_PATH storage
-| Field | Value |
-|---|---|
-| Peak required | ~2 Mbps write |
-| Storage type | local NVMe / local SATA / SMB / NFS / iSCSI (circle one) |
-| If remote: link speed | ______ Gbps |
-| If remote: protocol + version | e.g. SMB3.1.1 |
-| Storage host | ______ |
-| Free space at deploy | ______ TB |
-| Free space growth budget | 22 TB/yr for PCM · **11 TB/yr for alaw** · 2.8 TB/yr for Opus (Phase 3) |
-| Snapshot policy | ______ |
-
-### L8 — QA browsers → Recorder /playback
-| Field | Value |
-|---|---|
-| Peak required | 100-500 Mbps burst |
-| Number of concurrent reviewers (expected) | ______ |
-| Reviewer LAN segment | ______ |
-| Path to recorder (same VLAN? routed?) | ______ |
-| Link speed to reviewer switch | ______ Gbps |
-| Recorder-side NIC handles L3 + L8 + L9? | Y / N — if same NIC, note contention |
-
-### L9 — Recorder storage → Veeam
-| Field | Value |
-|---|---|
-| Peak required | ~940 Mbps sustained (full backup) |
-| Veeam host | ______ |
-| Veeam transport mode | NBD / Direct SAN / Hot-add / SMB copy (circle) |
-| Link speed / duplex | ______ Gbps / ____ (1 GbE **minimum**, 10 GbE recommended for PCM tier) |
-| Backup window (hours) | ______ |
-| Full-backup completion time (last measured) | ______ min |
-| Incremental frequency | e.g. hourly / 6-hour / daily |
-
----
-
-## 4. Backup sizing reference
-
-Copied from the storage plan for L9 context — networks team can use
-these numbers to size the backup window.
-
-| Codec | Per day (6,300 calls) | Full backup @ 1 GbE (theoretical, 112 MB/s) | @ 10 GbE (1.12 GB/s) |
-|---|---:|---:|---:|
-| PCM (s16le WAV) | 60.5 GB | **9 min** | **~1 min** |
-| a-law WAV (current) | 30.2 GB | **~4.5 min** | ~30 s |
-| Opus (Phase 3) | 7.6 GB | ~1 min | <10 s |
-
-Incrementals are ≤ per-day figures; typical Veeam changed-block
-tracking will send only the newly closed WAVs, so nightly deltas run
-in a fraction of the full-backup time.
-
----
-
-## 5. Host inventory (please confirm)
-
-| Role | Hostname / IP | OS | NICs (count × speed) | Rack / location |
+| # | Role | Hostname | IP | NIC / VLAN |
 |---|---|---|---|---|
-| Asterisk PBX | ______ | ______ | ______ | ______ |
-| dart-ari (if separate) | ______ | ______ | ______ | ______ |
-| dart-rtp-recorder | ______ | Windows Server (per current env) | ______ | ______ |
-| MySQL / Asterisk DB | ______ | ______ | ______ | ______ |
-| Recording storage (if separate from recorder) | ______ | ______ | ______ | ______ |
-| Veeam server | ______ | ______ | ______ | ______ |
-| Core / distribution switch | ______ | ______ | ______ | ______ |
-| ITSP CPE / SBC (if any) | ______ | ______ | ______ | ______ |
+| H1 | Asterisk PBX (+ ARI, + MySQL — currently co-located per dart-ari `.env`) | ? | `10.1.101.155` | ? |
+| H2 | dart-ari client (queue_app_main) | ? | ? _(same host as H1?)_ | ? |
+| H3 | **dart-rtp-recorder** | ? | `10.100.54.137` _(from recorder `.env`)_ **or** `10.1.101.155` _(from dart-ari `.env`)_ — reconcile | ? |
+| H4 | MySQL (Asterisk DB) | ? | `10.44.0.70` _(recorder .env)_ **or** `10.1.101.155` _(dart-ari .env)_ — reconcile | ? |
+| H5 | Recording storage (if separate from H3) | ? | ? | ? |
+| H6 | Veeam backup server | ? | ? | ? |
+| H7 | ITSP / SIP carrier CPE (if on-prem) | ? | ? | ? |
+| H8 | QA / supervisor subnet (playback clients) | n/a | ?/?? _(CIDR)_ | ? |
+| H9 | Agent phones subnet | n/a | ?/?? _(CIDR)_ | ? |
 
 ---
 
-## 6. Questions we'd like answers to
+## Service ports
 
-1. Is the recorder ↔ Asterisk RTP path (L3) on the **same VLAN** as
-   the SIP/RTP path (L1/L2), or does it cross a firewall / router?
-   L3 is high packet-rate (1500 pps at 30 calls) so a stateful
-   firewall in the path will show up as CPU on the firewall long
-   before it shows up as bandwidth.
-2. Is DSCP EF (46) marking preserved end-to-end for RTP, including on
-   L3? Some `externalMedia` implementations strip it.
-3. What is the sustained write throughput of the AUDIO_PATH volume?
-   If it's an SMB share, the recorder's per-packet `writeFromSync`
-   pattern (~1500 small writes/sec at 30 calls) can amplify SMB
-   round-trips beyond what raw MB/s suggests.
-4. Is the Veeam link a shared production LAN, or a dedicated backup
-   VLAN / SAN fabric? Full nightly PCM backup sustained at 940 Mbps
-   would saturate a shared 1 GbE segment for ~9 min.
-5. Are there any WAN links between agent phones and Asterisk (remote
-   agents, VPN)? If yes, L2 needs a WAN entry with round-trip
-   latency and jitter separately.
+| Host | Service | Port | Protocol | Source of truth |
+|---|---|---|---|---|
+| H1 | Asterisk ARI (HTTP + WebSocket) | `8088` | TCP | dart-ari `ASTERISK_ARI_PORT` |
+| H1 | Asterisk SIP | `5060` | UDP/TCP | seen in dart-ari `endpoint_push.dart` |
+| H1 | Asterisk RTP (media) | `10000-20000` _(default; confirm)_ | UDP | Asterisk `rtp.conf` |
+| H2 | dart-ari internal HTTP | `8001` | TCP | dart-ari `SERVER_PORT` |
+| H3 | Recorder control API | `8085` _(dart-ari)_ / **confirm** in recorder `.env` `HTTP_SERVER_PORT` | TCP | dart-ari `VOICE_LOGGER_PORT` |
+| H3 | Recorder RTP receive (externalMedia) | ephemeral UDP per call, assigned by recorder in `/start` reply | UDP | `RawDatagramSocket.bind(ip, 0)` in `worker_pool.dart` |
+| H4 | MySQL | `3306` | TCP | recorder `.env` `AST_DB_PORT` |
+| H6 | Veeam (data mover) | `2500-3300` _(default range)_ | TCP | Veeam config |
+
+---
+
+## Flows (who talks to whom)
+
+| # | From | To | Purpose |
+|---|---|---|---|
+| F1 | H2 dart-ari | H1 `:8088` | ARI HTTP + WebSocket (control + Stasis events) |
+| F2 | H2 dart-ari | H3 `:HTTP_SERVER_PORT` | `POST /start`, `POST /stop` |
+| F3 | H1 Asterisk | H3 ephemeral UDP | RTP media stream (externalMedia, a-law) |
+| F4 | H3 recorder | H4 `:3306` | MySQL insert on call finalize |
+| F5 | Browsers (H8) | H3 `:HTTP_SERVER_PORT` | `GET /playback?filename=X` |
+| F6 | H6 Veeam | H3 / H5 storage volume | Nightly backup of `AUDIO_PATH` |
+| F7 | Agents (H9) ↔ H1 | H1 SIP+RTP | Existing call path (unchanged) |
+| F8 | H7 ITSP ↔ H1 | H1 SIP+RTP | Existing trunk (unchanged) |
+
+---
+
+## Please confirm
+
+1. Are H1, H2, H4 the same physical box? (dart-ari `.env` suggests yes — all `10.1.101.155`.)
+2. What is the recorder's actual production IP? (recorder `.env` says `10.100.54.137`; dart-ari `.env` says `10.1.101.155`.)
+3. Is the MySQL at `10.44.0.70` (recorder view) or `10.1.101.155` (dart-ari view)? One of the `.env` files is stale.
+4. Subnet / CIDR for agent phones (H9) and QA workstations (H8).
+5. Veeam server IP (H6) and whether it uses a dedicated backup VLAN.

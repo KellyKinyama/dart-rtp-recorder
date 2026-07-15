@@ -1,136 +1,273 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
-import 'dart:typed_data';
 
 import 'package:dart_rtp_recorder/src/db_queries.dart';
 
-import '../codecs/g711/dart_g711.dart';
 import '../rtp/rtp_packet.dart';
-import '../wave/wave.dart';
+import 'recording_sink.dart';
+import 'sink_factory.dart';
 
+/// Directory where recordings are written. Populated from `AUDIO_PATH` in
+/// `bin/dart_rtp_recorder.dart`.
 String audioPath = '';
 
-Timer setTimeout(callback, [int duration = 30]) {
-  return Timer(Duration(seconds: duration), callback);
+/// Codec/container the recorder writes. Populated from `RECORDER_CODEC` in
+/// `bin/dart_rtp_recorder.dart`. Default `pcm` matches Phase 1.
+String recorderCodec = 'pcm';
+
+/// How long a recording may go without receiving any RTP before being
+/// auto-finalized. Populated from `RECORDER_IDLE_TIMEOUT_SECONDS` in
+/// `bin/dart_rtp_recorder.dart`.
+Duration recorderIdleTimeout = const Duration(seconds: 60);
+
+/// In-process registry of active recordings, keyed by sanitized filename.
+/// Consulted by the `/stop` HTTP endpoint to look up a live recording so it
+/// can be finalized deterministically.
+class RecordingRegistry {
+  static final Map<String, _ActiveRecording> _active = {};
+
+  static void _register(String filename, _ActiveRecording rec) {
+    _active[filename] = rec;
+  }
+
+  static _ActiveRecording? _remove(String filename) => _active.remove(filename);
+
+  /// Snapshot of currently active recording filenames — useful for /status
+  /// endpoints, tests, and shutdown draining.
+  static List<String> active() => List.unmodifiable(_active.keys);
 }
 
-void clearTimeout(Timer t) {
-  t.cancel();
-}
+class _ActiveRecording {
+  _ActiveRecording({
+    required this.socket,
+    required this.sink,
+    required this.filename,
+  }) : lastPacketAt = DateTime.now();
 
-enum RTP_STATE { INITIALISED, RTP_RECEIVED, RTP_FINISHED }
+  final RawDatagramSocket socket;
+  final RecordingSink sink;
+  final String filename;
 
-class RtpState {
-  RTP_STATE state = RTP_STATE.INITIALISED;
-  int rtpSampleSize = 0;
-}
+  DateTime lastPacketAt;
+  Timer? idleTimer;
+  Completer<RecordingResult>? _finalizing;
 
-void rtp_server(String ip, String filename, HttpRequest request) {
-  RawDatagramSocket.bind(InternetAddress(ip), 0)
-      .then((RawDatagramSocket socket) {
-    print('UDP Echo ready to receive');
-    print('${socket.address.address}:${socket.port}');
-
-    //Return the listening port
-    request.response
-        .write('{"file_name":"$filename","rtp_port":${socket.port}}');
-    request.response.close();
-
-    List<Uint8List> buffer = [];
-
-    RtpState state = RtpState();
-
-    callback() {
-      //if (counter == 0) {
-      List<int> record = [];
-      if (buffer.isEmpty) {
-        return;
-      } else {
-        print("RTP server state: ${state.state}");
-        if (state.state == RTP_STATE.RTP_FINISHED &&
-            state.rtpSampleSize == buffer.length) {
-          print("RTP server state changed to ${state.state}");
-          for (var element in buffer) {
-            for (int x = 0; x < element.lengthInBytes; x++) {
-              record.add(element[x]);
-            }
-          }
-
-          var buf = Uint8List.fromList(record);
-
-          print("Writing to file");
-          final pcmWave = Pcmtowave.pcmToWav(buf, 8000, 1);
-
-          final f = File("$audioPath/$filename.wav");
-
-          f.writeAsBytesSync(pcmWave);
-          DbQueries.insertFileName(filename);
-
-          //counter--;
-          //if (counter == 0) {
-          print('Cancel timer');
-          //timer.cancel(); // Stops the repeating timer
+  Future<RecordingResult> finalize() {
+    final existing = _finalizing;
+    if (existing != null) return existing.future;
+    final completer = Completer<RecordingResult>();
+    _finalizing = completer;
+    () async {
+      try {
+        idleTimer?.cancel();
+        try {
           socket.close();
-          buffer = [];
-          record = [];
+        } catch (_) {}
+        await sink.close();
+        final result = RecordingResult(
+          filename: filename,
+          path: sink.path,
+          codec: sink.codec,
+          container: sink.container,
+          sampleRate: sink.sampleRate,
+          packetCount: sink.packetCount,
+          bytesWritten: sink.bytesWritten,
+          duration: sink.duration,
+        );
+        try {
+          await DbQueries.insertRecording(
+            filename: filename,
+            codec: result.codec,
+            container: result.container,
+            sampleRate: result.sampleRate,
+            durationMs: result.duration.inMilliseconds,
+            bytes: result.bytesWritten,
+          );
+        } catch (e) {
+          print('DB insert failed for $filename: $e');
         }
-        if (state.state == RTP_STATE.RTP_RECEIVED &&
-            state.rtpSampleSize == buffer.length) {
-          state.state = RTP_STATE.RTP_FINISHED;
-          state.rtpSampleSize = buffer.length;
-          print("RTP server state changed to ${state.state}");
-        }
-        if (state.state == RTP_STATE.RTP_RECEIVED &&
-            state.rtpSampleSize != buffer.length) {
-          state.state = RTP_STATE.RTP_RECEIVED;
-          state.rtpSampleSize = buffer.length;
-          print("RTP server state changed to ${state.state}");
-        }
-        if (state.state == RTP_STATE.INITIALISED) {
-          state.state = RTP_STATE.RTP_RECEIVED;
-          state.rtpSampleSize = buffer.length;
-          print("RTP server state changed to ${state.state}");
-        }
+        completer.complete(result);
+      } catch (e, st) {
+        completer.completeError(e, st);
       }
+    }();
+    return completer.future;
+  }
+}
 
-      //}
-      //}
+/// Sanitize a caller-supplied filename to prevent path traversal and
+/// filesystem-hostile characters. Only alphanumerics plus `.`, `_`, `-`
+/// are kept; everything else becomes `_`.
+String _sanitizeFilename(String name) {
+  final invalid = RegExp(r'[^A-Za-z0-9._-]');
+  final cleaned = name.replaceAll(invalid, '_');
+  if (cleaned.isEmpty || cleaned == '.' || cleaned == '..') {
+    return 'recording';
+  }
+  return cleaned;
+}
+
+/// Start a new RTP recording. Binds an ephemeral UDP port on [ip], creates
+/// the on-disk sink, registers the recording, and replies to [request] with
+/// a JSON body containing the sanitized filename and the UDP port to send
+/// RTP to.
+Future<void> startRecording(
+  String ip,
+  String filename,
+  HttpRequest request,
+) async {
+  final safeName = _sanitizeFilename(filename);
+
+  // Reject duplicate active recordings for the same filename — otherwise
+  // two UDP sockets would race to write the same file.
+  if (RecordingRegistry._active.containsKey(safeName)) {
+    request.response.statusCode = HttpStatus.conflict;
+    request.response.headers.contentType = ContentType.json;
+    request.response.write(json.encode({
+      'error': 'recording already in progress',
+      'filename': safeName,
+    }));
+    await request.response.close();
+    return;
+  }
+
+  final RawDatagramSocket socket;
+  try {
+    socket = await RawDatagramSocket.bind(InternetAddress(ip), 0);
+  } catch (e) {
+    request.response.statusCode = HttpStatus.internalServerError;
+    request.response.headers.contentType = ContentType.json;
+    request.response.write(json.encode({
+      'error': 'UDP bind failed',
+      'detail': '$e',
+    }));
+    await request.response.close();
+    return;
+  }
+
+  final RecordingSink sink;
+  try {
+    sink = createRecordingSink(
+      '$audioPath/$safeName.wav',
+      codec: recorderCodec,
+    );
+    await sink.open();
+  } catch (e) {
+    try {
+      socket.close();
+    } catch (_) {}
+    request.response.statusCode = HttpStatus.internalServerError;
+    request.response.headers.contentType = ContentType.json;
+    request.response.write(json.encode({
+      'error': 'sink open failed',
+      'detail': '$e',
+    }));
+    await request.response.close();
+    return;
+  }
+
+  final active = _ActiveRecording(
+    socket: socket,
+    sink: sink,
+    filename: safeName,
+  );
+  RecordingRegistry._register(safeName, active);
+
+  print('Recording $safeName started on '
+      '${socket.address.address}:${socket.port} (codec=${sink.codec})');
+
+  request.response.headers.contentType = ContentType.json;
+  request.response.write(json.encode({
+    'file_name': safeName,
+    'rtp_port': socket.port,
+    'codec': sink.codec,
+    'container': sink.container,
+    'sample_rate': sink.sampleRate,
+  }));
+  await request.response.close();
+
+  socket.listen(
+    (RawSocketEvent event) {
+      if (event != RawSocketEvent.read) return;
+      final Datagram? d = socket.receive();
+      if (d == null) return;
+      try {
+        final packet = RTPpacket.fromList(d.data, d.data.lengthInBytes);
+        active.sink.write(packet.payload, packet.PayloadType);
+        active.lastPacketAt = DateTime.now();
+      } catch (e) {
+        print('Bad RTP packet for $safeName: $e');
+      }
+    },
+    onError: (Object e) {
+      print('UDP socket error on $safeName: $e');
+    },
+  );
+
+  // Safety net: if the caller never invokes /stop, finalize after
+  // `recorderIdleTimeout` seconds of RTP silence.
+  active.idleTimer = Timer.periodic(const Duration(seconds: 5), (t) {
+    if (DateTime.now().difference(active.lastPacketAt) >= recorderIdleTimeout) {
+      print('Recording $safeName idle for '
+          '${recorderIdleTimeout.inSeconds}s; finalizing');
+      t.cancel();
+      if (RecordingRegistry._remove(safeName) != null) {
+        // Log-and-swallow: nothing upstream is awaiting this future, so
+        // re-throwing here would just surface as an unhandled async error.
+        active.finalize().catchError((Object e) {
+          print('Finalize error for $safeName: $e');
+          // Return a synthetic result so the Future completes normally.
+          return RecordingResult(
+            filename: safeName,
+            path: active.sink.path,
+            codec: active.sink.codec,
+            container: active.sink.container,
+            sampleRate: active.sink.sampleRate,
+            packetCount: active.sink.packetCount,
+            bytesWritten: active.sink.bytesWritten,
+            duration: active.sink.duration,
+          );
+        });
+      }
     }
-
-    final codec = DartG711Codec.g711a();
-
-    //Timer t = setTimeout(callback, 30);
-
-    const oneSec = Duration(seconds: 30);
-    Timer.periodic(oneSec, (Timer t) {
-      callback();
-    });
-
-    socket.listen((RawSocketEvent e) {
-      Datagram? d = socket.receive();
-      if (d != null) {
-        //var data = String.fromCharCode(d.data);
-        //print('Datagram from ${d.address.address}:${d.port}');
-        RTPpacket rtPpacket = RTPpacket.fromList(d.data, d.data.lengthInBytes);
-
-        var sample = codec.decode(rtPpacket.payload);
-        buffer.add(sample);
-        //counter = 1;
-
-        //if (timerFlag) {
-        //clearTimeout(t);
-        //timerFlag = false;
-        // }
-      } else {
-        //counter = 0;
-        //if (!timerFlag) {
-        //t = setTimeout(callback, 30);
-        // timerFlag = true;
-        //}
-      }
-      //t = setTimeout(callback, 30);
-    });
   });
+}
 
-  //wsSipServer ws = wsSipServer("10.100.54.52", 8080);
+/// Finalize an in-flight recording. Looks it up in the registry, closes the
+/// UDP socket + sink, patches the WAV header, persists metadata to the DB,
+/// and returns the [RecordingResult] as JSON.
+Future<void> stopRecording(String filename, HttpRequest request) async {
+  final safeName = _sanitizeFilename(filename);
+  final active = RecordingRegistry._remove(safeName);
+  if (active == null) {
+    request.response.statusCode = HttpStatus.notFound;
+    request.response.headers.contentType = ContentType.json;
+    request.response.write(json.encode({
+      'error': 'no active recording',
+      'filename': safeName,
+    }));
+    await request.response.close();
+    return;
+  }
+  try {
+    final result = await active.finalize();
+    request.response.headers.contentType = ContentType.json;
+    request.response.write(json.encode(result.toJson()));
+    await request.response.close();
+  } catch (e) {
+    request.response.statusCode = HttpStatus.internalServerError;
+    request.response.headers.contentType = ContentType.json;
+    request.response.write(json.encode({
+      'error': 'finalize failed',
+      'detail': '$e',
+    }));
+    await request.response.close();
+  }
+}
+
+/// Backwards-compatible alias for the pre-Phase-0 API used by
+/// `HttpRtpServer`. New code should call [startRecording] directly.
+void rtp_server(String ip, String filename, HttpRequest request) {
+  startRecording(ip, filename, request);
 }

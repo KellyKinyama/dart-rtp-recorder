@@ -33,4 +33,49 @@ class DbQueries {
       await db.disconnect();
     }
   }
+
+  /// Persist a completed recording along with its codec/container metadata.
+  ///
+  /// Requires the `recordings` table to carry the columns below (in
+  /// addition to `filename`). If they are missing this method falls back to
+  /// a filename-only insert so an older DB schema keeps working:
+  ///
+  /// ```sql
+  /// ALTER TABLE recordings
+  ///   ADD COLUMN codec        VARCHAR(16) NULL,
+  ///   ADD COLUMN container    VARCHAR(16) NULL,
+  ///   ADD COLUMN sample_rate  INT         NULL,
+  ///   ADD COLUMN duration_ms  BIGINT      NULL,
+  ///   ADD COLUMN bytes        BIGINT      NULL;
+  /// ```
+  static Future<void> insertRecording({
+    required String filename,
+    required String codec,
+    required String container,
+    required int sampleRate,
+    required int durationMs,
+    required int bytes,
+  }) async {
+    final db = await getDbConnection();
+    try {
+      try {
+        await db.table('recordings').insert({
+          'filename': filename,
+          'codec': codec,
+          'container': container,
+          'sample_rate': sampleRate,
+          'duration_ms': durationMs,
+          'bytes': bytes,
+        });
+      } catch (e) {
+        print('insertRecording: extended insert failed ($e); '
+            'falling back to filename-only insert');
+        await db.table('recordings').insert({'filename': filename});
+      }
+    } catch (e) {
+      print('insertRecording: DB write failed for $filename: $e');
+    } finally {
+      await db.disconnect();
+    }
+  }
 }

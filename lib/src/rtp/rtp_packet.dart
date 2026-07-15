@@ -113,55 +113,124 @@ class RTPpacket {
   //--------------------------
   //Constructor of an RTPpacket object from the packet bistream
   //--------------------------
+  //
+  // Full RFC 3550 §5.1 header layout (12 fixed bytes + optional CSRC list
+  // + optional extension header, and optional trailing padding on the
+  // payload):
+  //
+  //   0                   1                   2                   3
+  //   0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+  //  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+  //  |V=2|P|X|  CC   |M|     PT      |       sequence number         |
+  //  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+  //  |                           timestamp                           |
+  //  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+  //  |           synchronization source (SSRC) identifier            |
+  //  +=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+
+  //  |            contributing source (CSRC) identifiers             |
+  //  |                             ....                              |
+  //  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+  //
+  // If X=1, a 4-byte extension header (`defined-by-profile:u16 |
+  // length:u16` where length is in 32-bit words) plus `length*4` bytes
+  // of extension body follow the CSRC list.
+  //
+  // If P=1, the LAST byte of the packet is the padding octet count
+  // (including itself); those bytes are trailing garbage on the
+  // payload and must be stripped before hand-off to the codec.
+  //
+  // The previous implementation ignored P/X/CC entirely, so any packet
+  // from a softphone using the RFC 6464 audio-level extension, or from
+  // a mixer inserting CSRCs, would silently prepend or append header
+  // bytes to the audio payload — audible as clicks or static.
   factory RTPpacket.fromList(Uint8List packet, int packet_size) {
-    //fill default fields:
-    int Version = 2;
-    int Padding = 0;
-    int Extension = 0;
-    int CC = 0;
-    int Marker = 0;
-    int Ssrc = 0;
-    int PayloadType = 0;
-    int SequenceNumber = 0;
-    int TimeStamp = 0;
-    int payload_size = packet_size - HEADER_SIZE;
-    Uint8List payload = Uint8List(payload_size);
-
-    if (packet.lengthInBytes < 13) {
-      // As per RFC 3550 - the header is 12 bytes, there must be data - anything less is a bad packet.
-      throw ("Packet too short, expecting at least 13 bytes, but found ${packet.lengthInBytes}");
+    if (packet_size < HEADER_SIZE + 1) {
+      // RFC 3550: 12-byte header + at least 1 payload byte.
+      throw FormatException(
+        'RTP packet too short: expected at least ${HEADER_SIZE + 1} bytes, '
+        'got $packet_size',
+      );
     }
-    if ((packet[0] & 0xC0) != Version << 6) {
-      // This is not a valid version number.
-      throw ("Invalid version number found, expecting $Version");
+    // Guard against callers passing packet_size > buffer length.
+    if (packet_size > packet.lengthInBytes) {
+      throw FormatException(
+        'RTP packet_size ($packet_size) exceeds buffer length '
+        '(${packet.lengthInBytes})',
+      );
     }
 
-    //check if total packet size is lower than the header size
-    if (packet_size >= HEADER_SIZE) {
-      //get the header bitsream:
-      Uint8List header = Uint8List(HEADER_SIZE);
-      for (int i = 0; i < HEADER_SIZE; i++) {
-        header[i] = packet[i];
+    final int version = (packet[0] >> 6) & 0x03;
+    if (version != 2) {
+      throw FormatException(
+        'Invalid RTP version: expected 2, got $version',
+      );
+    }
+    final int padding = (packet[0] >> 5) & 0x01;
+    final int extension = (packet[0] >> 4) & 0x01;
+    final int cc = packet[0] & 0x0F;
+    final int marker = (packet[1] >> 7) & 0x01;
+    final int payloadType = packet[1] & 0x7F;
+
+    final bd = ByteData.view(
+        packet.buffer, packet.offsetInBytes, packet.lengthInBytes);
+    final int sequenceNumber = bd.getUint16(2, Endian.big);
+    final int timestamp = bd.getUint32(4, Endian.big);
+    final int ssrc = bd.getUint32(8, Endian.big);
+
+    // Payload starts after the fixed header + 4*CC CSRC bytes + optional
+    // extension header.
+    int payloadStart = HEADER_SIZE + 4 * cc;
+    if (payloadStart > packet_size) {
+      throw FormatException(
+        'RTP packet truncated in CSRC list (need $payloadStart bytes, '
+        'have $packet_size)',
+      );
+    }
+    if (extension == 1) {
+      if (payloadStart + 4 > packet_size) {
+        throw FormatException('RTP packet truncated in extension header');
       }
-
-      //get the payload bitstream:
-      payload_size = packet_size - HEADER_SIZE;
-      payload = Uint8List(payload_size);
-      for (int i = HEADER_SIZE; i < packet_size; i++) {
-        payload[i - HEADER_SIZE] = packet[i];
+      final int extLenWords = bd.getUint16(payloadStart + 2, Endian.big);
+      payloadStart += 4 + 4 * extLenWords;
+      if (payloadStart > packet_size) {
+        throw FormatException(
+          'RTP packet truncated in extension body (need $payloadStart '
+          'bytes, have $packet_size)',
+        );
       }
-
-      //interpret the changing fields of the header:
-      PayloadType = header[1] & 127;
-      SequenceNumber = unsigned_int(header[3]) + 256 * unsigned_int(header[2]);
-      TimeStamp = unsigned_int(header[7]) +
-          256 * unsigned_int(header[6]) +
-          65536 * unsigned_int(header[5]) +
-          16777216 * unsigned_int(header[4]);
     }
 
-    return RTPpacket(
-        PayloadType, SequenceNumber, TimeStamp, payload, packet_size);
+    int payloadEnd = packet_size;
+    if (padding == 1) {
+      final int padCount = packet[packet_size - 1];
+      if (padCount < 1 || payloadStart + padCount > packet_size) {
+        throw FormatException(
+          'RTP padding octet count invalid: $padCount '
+          '(payloadStart=$payloadStart, packet_size=$packet_size)',
+        );
+      }
+      payloadEnd -= padCount;
+    }
+
+    final int payloadSize = payloadEnd - payloadStart;
+    if (payloadSize < 0) {
+      throw FormatException('RTP payload size negative after header parsing');
+    }
+    final Uint8List payload = Uint8List.sublistView(
+      packet,
+      payloadStart,
+      payloadEnd,
+    );
+
+    final rtp =
+        RTPpacket(payloadType, sequenceNumber, timestamp, payload, payloadSize);
+    rtp.Version = version;
+    rtp.Padding = padding;
+    rtp.Extension = extension;
+    rtp.CC = cc;
+    rtp.Marker = marker;
+    rtp.Ssrc = ssrc;
+    return rtp;
   }
 
   //--------------------------

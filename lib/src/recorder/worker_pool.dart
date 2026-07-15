@@ -163,8 +163,7 @@ class RecorderWorkerPool {
         final filename = msg['filename'] as String;
         final worker = _routing.remove(filename);
         if (worker != null) {
-          worker.activeCount =
-              (worker.activeCount - 1).clamp(0, 1 << 30);
+          worker.activeCount = (worker.activeCount - 1).clamp(0, 1 << 30);
         }
         final db = msg['db'];
         if (db is Map) _mainDbInsert(db.cast<String, dynamic>());
@@ -347,12 +346,12 @@ Future<void> _workerEntry(_WorkerBootstrap boot) async {
       case 'start':
         // Fire-and-forget the async handler so subsequent messages
         // aren't blocked behind a slow socket bind.
-        unawaited(_handleStart(
-            msg.cast<String, dynamic>(), active, mainInbound));
+        unawaited(
+            _handleStart(msg.cast<String, dynamic>(), active, mainInbound));
         break;
       case 'stop':
-        unawaited(_handleStop(
-            msg.cast<String, dynamic>(), active, mainInbound));
+        unawaited(
+            _handleStop(msg.cast<String, dynamic>(), active, mainInbound));
         break;
       case 'shutdown':
         final reply = msg['reply'] as SendPort?;
@@ -456,8 +455,8 @@ Future<void> _handleStop(
     return;
   }
   try {
-    final result = await _workerFinalize(rec, active, mainInbound,
-        autoFinalized: false);
+    final result =
+        await _workerFinalize(rec, active, mainInbound, autoFinalized: false);
     reply.send({'ok': true, 'result': result});
   } catch (e) {
     reply.send({'ok': false, 'error': '$e'});

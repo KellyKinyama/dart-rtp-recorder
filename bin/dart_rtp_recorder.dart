@@ -56,8 +56,7 @@ Future<void> main(List<String> arguments) async {
   // (clamped to [1..16]); set `RECORDER_WORKER_COUNT=0` to force the
   // legacy inline path (recording runs on the main isolate).
   final requestedWorkers = int.tryParse(env['RECORDER_WORKER_COUNT'] ?? '');
-  final defaultWorkers =
-      (Platform.numberOfProcessors - 1).clamp(1, 16).toInt();
+  final defaultWorkers = (Platform.numberOfProcessors - 1).clamp(1, 16).toInt();
   final workerCount = requestedWorkers ?? defaultWorkers;
   if (workerCount > 0) {
     await RecorderWorkerPool.initialize(

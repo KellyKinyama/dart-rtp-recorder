@@ -96,8 +96,8 @@ void main() {
         // RawDatagramSocket.send is non-blocking; if the OS UDP buffer
         // is momentarily full it returns 0. Retry until the whole
         // datagram is queued.
-        while (sender.send(pkt, InternetAddress('127.0.0.1'), outcome.port) ==
-            0) {
+        while (
+            sender.send(pkt, InternetAddress('127.0.0.1'), outcome.port) == 0) {
           await Future<void>.delayed(const Duration(milliseconds: 2));
         }
         // Tiny yield so the receive-side isolate gets scheduled between
@@ -181,8 +181,7 @@ void main() {
       await pool.stop('dup');
     });
 
-    test('auto-finalizes on RTP idle and drops from routing table',
-        () async {
+    test('auto-finalizes on RTP idle and drops from routing table', () async {
       await RecorderWorkerPool.initialize(
         mode: WorkerMode.isolated,
         workerCount: 1,
